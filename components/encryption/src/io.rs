@@ -1,7 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    io::{Error as IoError, ErrorKind, Read, Result as IoResult},
+    io::{Error as IoError, ErrorKind, Read, Result as IoResult, Write},
     pin::Pin,
 };
 
@@ -12,7 +12,7 @@ use futures_util::{
 use kvproto::encryptionpb::EncryptionMethod;
 use openssl::symm::{Cipher as OCipher, Crypter as OCrypter, Mode};
 
-use crate::{Cipher, Error, Iv, Result};
+use crate::{Iv, Result};
 
 /// Encrypt content as data being read.
 pub struct EncrypterReader<R>(CrypterReader<R>);
@@ -67,23 +67,26 @@ impl<R: AsyncRead + Unpin> AsyncRead for DecrypterReader<R> {
     }
 }
 
-pub fn create_crypter(
+pub fn create_aes_ctr_crypter(
     method: EncryptionMethod,
     key: &[u8],
     mode: Mode,
-    iv: Option<&[u8]>,
+    iv: Iv,
 ) -> Result<(OCipher, OCrypter)> {
-    match Cipher::from(method) {
-        Cipher::Plaintext => Err(Error::Other(
-            "init crypter while encryption is not enabled"
-                .to_owned()
-                .into(),
-        )),
-        Cipher::AesCtr(cipher) => {
-            let crypter = OCrypter::new(cipher, mode, key, iv)?;
-            Ok((cipher, crypter))
-        }
+    match iv {
+        Iv::Ctr(_) => {}
+        _ => return Err(box_err!("mismatched IV type")),
     }
+    let cipher = match method {
+        EncryptionMethod::Unknown | EncryptionMethod::Plaintext => {
+            return Err(box_err!("init crypter while encryption is not enabled"))
+        }
+        EncryptionMethod::Aes128Ctr => OCipher::aes_128_ctr(),
+        EncryptionMethod::Aes192Ctr => OCipher::aes_192_ctr(),
+        EncryptionMethod::Aes256Ctr => OCipher::aes_256_ctr(),
+    };
+    let crypter = OCrypter::new(cipher, mode, key, Some(iv.as_slice()))?;
+    Ok((cipher, crypter))
 }
 
 /// Implementation of EncrypterReader and DecrypterReader.
@@ -102,8 +105,8 @@ impl<R> CrypterReader<R> {
         iv: Option<Iv>,
     ) -> Result<(CrypterReader<R>, Iv)> {
         crate::verify_encryption_config(method, &key)?;
-        let iv = iv.unwrap_or_else(|| Iv::new());
-        let (cipher, crypter) = create_crypter(method, key, mode, Some(iv.as_slice()))?;
+        let iv = iv.unwrap_or_else(|| Iv::new_ctr());
+        let (cipher, crypter) = create_aes_ctr_crypter(method, key, mode, iv)?;
         let block_size = cipher.block_size();
         Ok((
             CrypterReader {
@@ -157,5 +160,66 @@ impl<R: AsyncRead + Unpin> AsyncRead for CrypterReader<R> {
             _ => return poll,
         };
         Poll::Ready(inner.do_crypter(buf, read_count))
+    }
+}
+
+pub struct EncrypterWriter<W: Write> {
+    writer: W,
+    crypter: OCrypter,
+    block_size: usize,
+}
+
+impl<W: Write> EncrypterWriter<W> {
+    pub fn new(
+        writer: W,
+        method: EncryptionMethod,
+        key: &[u8],
+        iv: Iv,
+    ) -> Result<EncrypterWriter<W>> {
+        crate::verify_encryption_config(method, &key)?;
+        let (cipher, crypter) = create_aes_ctr_crypter(method, key, Mode::Encrypt, iv)?;
+        let block_size = cipher.block_size();
+        Ok(EncrypterWriter {
+            writer,
+            crypter,
+            block_size,
+        })
+    }
+}
+
+impl<W: Write> Write for EncrypterWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        let mut encrypt_buffer = vec![0; buf.len() + self.block_size];
+        let bytes = self.crypter.update(buf, &mut encrypt_buffer)?;
+        // The EncrypterWriter current only support crypters that always return the same amount
+        // of data. This is true for CTR mode.
+        if bytes != buf.len() {
+            return Err(IoError::new(
+                ErrorKind::Other,
+                format!(
+                    "EncrypterWriter output size mismatch, expect {} vs actual {}",
+                    buf.len(),
+                    bytes,
+                ),
+            ));
+        }
+        self.writer.write_all(&encrypt_buffer[0..bytes])?;
+        Ok(bytes)
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write> Drop for EncrypterWriter<W> {
+    fn drop(&mut self) {
+        let mut encrypt_buffer = vec![0; self.block_size];
+        let bytes = self.crypter.finalize(&mut encrypt_buffer).unwrap();
+        if bytes != 0 {
+            // The EncrypterWriter current only support crypters that always return the same amount
+            // of data. This is true for CTR mode.
+            panic!("unsupported encryption");
+        }
     }
 }
